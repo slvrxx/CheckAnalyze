@@ -49,10 +49,14 @@ def _prepare_dummy_receipt(monkeypatch, db, service):
         session.flush()
         user_id = user.id
 
-        category = db.Category(name="Продукты", code="12")
-        session.add(category)
+        food_category = db.Category(name="Продукты", code="12")
+        session.add(food_category)
         session.flush()
-        category_id = category.id
+        food_category_id = food_category.id
+
+        beer_category = db.Category(name="Пиво", code="38")
+        session.add(beer_category)
+        session.flush()
 
     parse_result = ReceiptParseResult(
         merchant_name="Магазин",
@@ -70,7 +74,7 @@ def _prepare_dummy_receipt(monkeypatch, db, service):
             description="Продукты",
             amount=150.0,
             currency="RUB",
-            category_id=category_id,
+            category_id=food_category_id,
             category_name="Продукты",
             confidence=0.91,
         ),
@@ -118,13 +122,17 @@ def test_set_category_and_confirm(monkeypatch, app_modules):
 
     processed = service.process_receipt_bytes(user_id, b"pdf-data", source="telegram")
 
-    message, success = service.set_receipt_item_category(user_id, processed.receipt_id, 2, "Продукты")
+    message, success = service.set_receipt_item_category(user_id, processed.receipt_id, 2, "Пиво")
     assert success
     assert "Строка 2" in message
 
     confirm_message, confirmed = service.confirm_receipt(user_id, processed.receipt_id)
     assert confirmed
     assert "Команды для записи" in confirm_message
+
+    commands_block = confirm_message.split("Команды для записи:", 1)[1].strip().splitlines()
+    assert commands_block[0] == "E 150 RUB 12 1 Продукты"
+    assert commands_block[1] == "E 50 RUB 38 1 Пиво"
 
     with db.session_scope() as session:
         receipt = session.query(db.Receipt).get(processed.receipt_id)

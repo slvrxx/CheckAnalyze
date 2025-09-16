@@ -336,13 +336,44 @@ def confirm_receipt(user_id: int, receipt_id: int) -> tuple[str, bool]:
 
 def _format_final_commands(items: Sequence[ReceiptItem]) -> str:
     lines = ["Команды для записи:"]
+
     for item in items:
-        approx_flag = 0
-        category_name = item.selected_category.name if item.selected_category else "UNKNOWN"
+        entry_type = "I" if item.is_income else "E"
+        amount_value = _format_amount(float(item.amount))
+        currency = (item.currency or "RUB").upper()
+        category_token = _category_token(item)
+        accuracy_flag = 1  # PDF суммы считаем точными
+        comment = _format_comment(item.description)
+
         lines.append(
-            f"E {float(item.amount):.2f} {item.currency} {approx_flag} {category_name}: {item.description}"
+            f"{entry_type} {amount_value} {currency} {category_token} {accuracy_flag} {comment}"
         )
+
     return "\n".join(lines)
+
+
+def _format_amount(value: float) -> str:
+    text = f"{value:.2f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _category_token(item: ReceiptItem) -> str:
+    category = item.selected_category
+    if category and category.code:
+        return category.code
+    if category and category.id:
+        return str(category.id)
+    if item.selected_category_id:
+        return str(item.selected_category_id)
+    if item.predicted_category_id:
+        return str(item.predicted_category_id)
+    return "UNKNOWN"
+
+
+def _format_comment(description: str) -> str:
+    return " ".join(description.strip().split()) or "—"
 
 
 def _maybe_update_merchant_default(session, merchant_id: int, items: Sequence[ReceiptItem]) -> None:
