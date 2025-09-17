@@ -1,192 +1,136 @@
 # CheckAnalyze
 
-Сервис для автоматического разбора кассовых чеков в PDF и формирования команд для записи расходов/доходов. Источники чеков:
-
-* Telegram-бот (принимает PDF-файлы как документы);
-* почтовый ящик IMAP (принимает письма с PDF-вложениями).
-
-После обработки чек разбирается на позиции, каждой позиции подбирается категория расходов и формируется строка формата `E/I сумма валюта точность комментарий`, готовая для вставки в систему учёта.
+Сервис принимает кассовые чеки из Telegram и почтового ящика IMAP, сохраняет вложения на диск и позволяет подтверждать их через команду `/inbox` в боте. После подтверждения автоматически создаются записи в таблице `transactions` с привязкой к чеку.
 
 ## Возможности
 
-* Извлечение текста из PDF (pdfplumber) с fallback на OCR (pytesseract) для сканов.
-* Определение продавца (название, ИНН) и общей суммы.
-* Хранение данных по торговым точкам (`merchant_profiles`) и сохранение извлечённых позиций (`receipt_items`).
-* Самообучение на основе подтверждённых пользователем категорий (`category_training_samples`) с помощью логистической регрессии и TF-IDF.
-* Интеграция с PostgreSQL и расширение существующей схемы без нарушения текущего функционала.
-* Интеграция с почтой: отображение email-адресов на пользователей (`email_identities`).
+- Чтение писем из IMAP и загрузка вложений PDF/JPG/PNG в файловое хранилище.
+- Создание записей `email_inbox`, `receipts`, `receipt_items` и связь транзакций с чеками через `receipt_id`.
+- Команда `/inbox` в Telegram с inline-кнопками: «Подтвердить общую сумму», «Разнести по позициям», «Отклонить».
+- Очистка оригинальных файлов чеков после подтверждения или отклонения.
+- Конфигурация через `.env`, systemd unit + timer для почтового сборщика и минимальные тесты на PostgreSQL.
 
-## Установка на VPS (Ubuntu 22.04)
+## Развёртывание на Ubuntu 22.04
 
-1. Установите системные зависимости для обработки PDF и OCR:
+Ниже пример для сервера, где уже установлен PostgreSQL и создана база данных для проекта.
 
+1. Установите системные зависимости и создайте пользователя/базу в PostgreSQL (если ещё не сделано):
    ```bash
    sudo apt update
-   sudo apt install -y python3-venv python3-dev build-essential libpoppler-cpp-dev \
-       tesseract-ocr tesseract-ocr-rus git
+   sudo apt install -y python3-venv python3-pip git postgresql postgresql-contrib
+   sudo -u postgres createuser -P checkanalyze      # задайте пароль
+   sudo -u postgres createdb -O checkanalyze checkanalyze
    ```
 
-2. Клонируйте репозиторий и создайте виртуальное окружение:
-
+2. Клонируйте репозиторий и подготовьте виртуальное окружение:
    ```bash
-   git clone https://github.com/<your-org>/checkanalyze.git
-   cd checkanalyze
+   cd /opt
+   sudo git clone https://example.com/checkanalyze.git CheckAnalyze
+   cd CheckAnalyze
+   sudo chown -R $USER:$USER .
    python3 -m venv .venv
    source .venv/bin/activate
    pip install --upgrade pip
-   pip install -e .[dev]
+   pip install -r requirements.txt
    ```
 
-3. Создайте файл `.env` рядом с `pyproject.toml` и заполните переменные окружения (см. ниже). Пример:
-
+3. Скопируйте шаблон `.env` и заполните значения:
    ```bash
-   cat > .env <<'EOF'
-   DATABASE_URL=postgresql+psycopg2://checkanalyze:password@127.0.0.1:5432/checkanalyze
-   TELEGRAM_BOT_TOKEN=123456789:abcdef
-   TELEGRAM_ALLOWED_CHAT_ID=123456789
-   IMAP_HOST=imap.example.com
-   IMAP_USERNAME=receipts@example.com
-   IMAP_PASSWORD=app-password
-   IMAP_MAILBOX=INBOX
-   DEFAULT_USER_ID=1
-   EOF
+   cp .env.example .env
+   nano .env
+   ```
+   Обязательно укажите реквизиты БД (`DB_*`), путь к каталогу чеков (`RECEIPTS_DIR`), параметры IMAP и токен Telegram-бота.
+
+4. Создайте каталог для файлов чеков и выдайте права сервисному пользователю:
+   ```bash
+   mkdir -p /opt/CheckAnalyze/receipts
+   chown $USER:$USER /opt/CheckAnalyze/receipts
    ```
 
-4. Инициализируйте схему БД (на той же PostgreSQL, что и остальная система учёта):
-
+5. Примените SQL-миграцию (можно запускать повторно — скрипт идемпотентный):
    ```bash
    source .venv/bin/activate
-   checkanalyze initdb
+   psql "host=$DB_HOST port=$DB_PORT dbname=$DB_NAME user=$DB_USER" -f migrations/0001_prod_schema.sql
+   psql "host=$DB_HOST port=$DB_PORT dbname=$DB_NAME user=$DB_USER" -f migrations/0001_prod_schema.sql
    ```
 
-5. (Опционально) Настройте systemd-сервисы для бота и почтового воркера. Пример юнита:
-
-   ```ini
-   [Unit]
-   Description=CheckAnalyze Telegram bot
-   After=network.target
-
-   [Service]
-   WorkingDirectory=/opt/checkanalyze
-   Environment="PYTHONPATH=/opt/checkanalyze"
-   EnvironmentFile=/opt/checkanalyze/.env
-   ExecStart=/opt/checkanalyze/.venv/bin/checkanalyze telegram
-   Restart=always
-
-   [Install]
-   WantedBy=multi-user.target
+6. Установите и активируйте systemd unit и таймер для почтового сборщика:
+   ```bash
+   sudo cp deploy/checkbot-imap.service /etc/systemd/system/
+   sudo cp deploy/checkbot-imap.timer /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now checkbot-imap.timer
    ```
+   Таймер запускает `checkanalyze.imap_fetcher` каждую минуту. Логи доступны через `journalctl -u checkbot-imap.service`.
 
-   Аналогично можно описать сервис `checkanalyze email-worker`.
-
-Пакеты `libpoppler-cpp-dev` и `tesseract-ocr` необходимы для корректной работы `pdf2image` и `pytesseract`.
-
-## Конфигурация
-
-Переменные окружения (хранятся в `.env`):
-
-| Переменная | Назначение |
-|------------|------------|
-| `DATABASE_URL` | Строка подключения SQLAlchemy к PostgreSQL (должна указывать на существующую БД). |
-| `TELEGRAM_BOT_TOKEN` | Токен Telegram-бота, полученный у `@BotFather`. |
-| `TELEGRAM_ALLOWED_CHAT_ID` | (опционально) ID чата/пользователя, которому разрешено пользоваться ботом. |
-| `IMAP_HOST`, `IMAP_USERNAME`, `IMAP_PASSWORD` | Параметры IMAP-доступа к почтовому ящику чеков. Рекомендуется выделить отдельный ящик. |
-| `IMAP_MAILBOX` | Название IMAP-папки (по умолчанию `INBOX`). |
-| `IMAP_CHECK_INTERVAL` | Интервал опроса почты в секундах (по умолчанию 120). |
-| `IMAP_USE_SSL` | `1` для IMAPS (по умолчанию 1). |
-| `DEFAULT_USER_ID` | Пользователь по умолчанию, если не найдено сопоставление email → пользователь. |
-
-## Структура базы данных
-
-К существующим таблицам добавлены:
-
-* `merchant_profiles` — справочник торговых точек, хранит название, ИНН, категорию по умолчанию и подсказки.
-* `receipt_items` — извлечённые позиции из чеков с прогнозами категорий.
-* `category_training_samples` — обучающие примеры для модели классификации категорий.
-* `email_identities` — связывает email-адреса с пользователями для почтового импорта.
-
-`CategoryTrainingSample` и `ReceiptItem` используются для обучения и истории обработки. Таблица `receipts` позволяет хранить статус («pending»/«confirmed») и источник данных («telegram»/«email»).
-
-## Настройка почтового ящика
-
-1. Создайте отдельный email-адрес (например, `receipts@example.com`). Для публичных сервисов (Gmail, Яндекс и т.д.) включите IMAP и создайте отдельный пароль приложения.
-2. Укажите IMAP-параметры в `.env` (`IMAP_HOST`, `IMAP_USERNAME`, `IMAP_PASSWORD`, при необходимости `IMAP_MAILBOX`).
-3. Сопоставьте адреса отправителей с пользователями системы учёта:
-
+7. Запустите Telegram-бота (через CLI или отдельный unit):
    ```bash
    source .venv/bin/activate
-   checkanalyze receipts link-email receipts@example.com --user-id 1
-   checkanalyze receipts link-email another.user@example.com --user-id 2
+   python -m checkanalyze.cli telegram
    ```
+   Для постоянной работы оформите systemd-сервис по аналогии с IMAP-таской.
 
-   Если письмо пришло с нераспознанного адреса, будет использован `DEFAULT_USER_ID`.
+## Переменные окружения
 
-## Работа с Telegram-ботом
+| Переменная         | Назначение |
+|--------------------|-----------|
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Доступ к PostgreSQL. |
+| `RECEIPTS_DIR`     | Каталог для сохранения оригинальных файлов чеков. |
+| `IMAP_HOST`, `IMAP_PORT`, `IMAP_USE_SSL`, `IMAP_USERNAME`, `IMAP_PASSWORD`, `IMAP_MAILBOX` | Параметры IMAP-сервера. |
+| `TELEGRAM_BOT_TOKEN` | Токен бота от `@BotFather`. |
+| `TELEGRAM_ADMIN_ID` | (опционально) ID оператора, которому разрешена работа с ботом. |
+| `DEFAULT_USER_ID`  | ID пользователя по умолчанию, если email отправителя не найден. |
 
-1. Создайте бота через `@BotFather`, получите токен и добавьте его в `.env`.
-2. (Опционально) Узнайте свой `chat_id` (например, через бота `@userinfobot`) и установите `TELEGRAM_ALLOWED_CHAT_ID`, чтобы ограничить доступ.
-3. Запустите бота: `checkanalyze telegram`.
-4. Основные команды в чате:
+## Почтовый ящик
 
-   * Отправьте PDF → бот создаст чек и покажет предложенные категории.
-   * `/categories` — показать все доступные категории из вашей БД.
-   * `/cat <номер строки> <категория>` — заменить категорию у строки (категорию можно указать по ID, коду или части названия). Для работы с прошлыми чеками используйте `/cat <id чека> <номер> <категория>`.
-   * `/confirm` или `/confirm <id>` — подтвердить чек, зафиксировать обучение и получить итоговые команды `E ...`.
-   * `/pending` — список неподтверждённых чеков.
-   * `/receipt <id>` — показать конкретный чек повторно.
+Создайте отдельный почтовый ящик (например, `receipts@example.com`) и включите IMAP. В `.env` укажите параметры подключения. Письма с вложениями PDF/JPG/PNG будут загружены в `RECEIPTS_DIR`, добавлены в `email_inbox`, а для каждого вложения создаётся запись `receipts` со статусом `pending`.
 
-После подтверждения категории и команды сохраняются в базе и используются для самообучения модели; по мерчантам автоматически обновляется категория по умолчанию, если накопилось достаточно подтверждений.
+Письма с одинаковым `Message-ID` не создают дубли и помечаются как обработанные. Пользователь определяется по email (если в таблице `users` есть колонка `email`) либо через `DEFAULT_USER_ID`/первую запись в таблице.
 
-## Работа через CLI
+## Telegram-бот
 
-Для удалённых сценариев доступны вспомогательные команды:
+Команда `/inbox` выводит список чеков текущего пользователя со статусом `pending` и inline-кнопками:
 
-```bash
-checkanalyze receipts pending --user-id 1        # список неподтверждённых чеков
-checkanalyze receipts show 12 --user-id 1        # подробности по чеку
-checkanalyze receipts confirm 12 --user-id 1     # подтверждение и выдача команд
-checkanalyze receipts categories --user-id 1     # список категорий
-checkanalyze receipts link-email inbox@example.com --user-id 1
-```
+- **Подтвердить общую сумму** — создаёт одну транзакцию на сумму `receipts.total_amount`, заполняет `transactions.receipt_id` и `source`.
+- **Разнести по позициям** — создаёт транзакции по строкам `receipt_items`. Если у позиции нет `category_id`, используется первая доступная категория.
+- **Отклонить** — помечает чек как `failed`.
 
-## Поток обработки и самообучение
+Загруженные через Telegram файлы сохраняются как `source="telegram"` и также отображаются в `/inbox`.
 
-1. Чек поступает через Telegram или email — создаётся запись в таблице `receipts`, а строки попадают в `receipt_items`.
-2. Пользователь проверяет и при необходимости корректирует категории (`/cat`).
-3. После команды `/confirm` строки переводятся в статус «confirmed», в `category_training_samples` добавляются примеры для обучения, модель классификации переобучается, а по мерчанту при необходимости обновляется категория по умолчанию.
+## Очистка файлов
 
-Если вы вручную вносите транзакции в систему учёта, поле мерчанта остаётся необязательным — сервис работает и с пустым `merchant_id`.
+После успешного подтверждения (`confirmed`) или отклонения (`failed`) сервис удаляет оригинальный файл из `RECEIPTS_DIR`. Для контроля объёма диска можно периодически проверять каталог — в нём остаются только нев обработанные (`pending`) чеки.
 
-## Запуск
+## Качество кода и тесты
 
-Инициализируйте БД и запустите нужные сервисы через CLI:
+- Установите `pre-commit` и активируйте хуки: `pre-commit install`.
+- Локальная проверка: `pre-commit run --all-files`.
+- Тесты: `pytest`. Они поднимают временную БД PostgreSQL (через `pytest-postgresql`) и проверяют, что миграция применима дважды, а почтовый парсер создаёт записи и игнорирует дубликаты.
 
-```bash
-source .venv/bin/activate
-checkanalyze initdb                     # создание таблиц
-checkanalyze telegram                   # запуск Telegram-бота (polling)
-checkanalyze email-worker               # запуск почтового воркера (бесконечный цикл)
-checkanalyze email-worker --no-forever  # одиночный проход без цикла
-```
+> ⚠️ Для запуска тестов требуется доступность утилит PostgreSQL (`initdb`, `pg_ctl`). В CI подготовьте образ с установленным сервером или Docker-контейнер.
 
-По умолчанию email-воркер ищет непрочитанные письма с PDF-вложениями, определяет пользователя по email-адресу (`email_identities`) либо использует `DEFAULT_USER_ID`, обрабатывает вложения и отмечает письмо как прочитанное.
+## Makefile и полезные команды
 
-## Обучение модели категорий
-
-При подтверждении чека (`/confirm` или `checkanalyze receipts confirm ...`) все строки записываются в `category_training_samples`. Модель классификации переобучается автоматически, а также обновляется базовая категория у мерчанта, если большинство строк чека относится к одной статье.
-
-## Тестирование
+В репозитории есть `Makefile` с базовыми целями:
 
 ```bash
-pytest
+make install   # установка зависимостей в текущем окружении
+make lint      # ruff + black + mypy
+make test      # pytest
+make bot       # запуск Telegram-бота
+make imap      # единичный запуск IMAP-пуллера
 ```
 
-Тесты используют in-memory SQLite, переопределяя подключение через переменные окружения.
+## Очередность действий оператора
 
-## Ограничения и дальнейшие улучшения
+1. Отправьте чек в Telegram или переадресуйте на выделенную почту.
+2. В `/inbox` проверьте позиции, при необходимости скорректируйте категории в БД.
+3. Подтвердите чек (общая сумма или позиции). Транзакции создадутся автоматически, файл удалится.
+4. При ошибке используйте кнопку «Отклонить» — файл будет очищен, а чек помечен как `failed`.
 
-* Разбор PDF выполняется эвристически. Для сложных форматов может потребоваться тонкая настройка.
-* Модель классификации обучается на локальных данных и может требовать регулярного пополнения обучающих примеров.
-* Для работы OCR необходимы системные пакеты `tesseract-ocr` и языковые модели.
-* Email-воркер не отправляет уведомления — обработанные чеки удобно просматривать через Telegram или CLI.
+## Системные файлы
 
+- `deploy/checkbot-imap.service` — oneshot-сервис, запускающий `python3 -m checkanalyze.imap_fetcher`.
+- `deploy/checkbot-imap.timer` — таймер на каждую минуту (`OnBootSec=30s`, `OnUnitActiveSec=60s`).
+
+Эти файлы копируются в `/etc/systemd/system/` и активируются командой `systemctl enable --now checkbot-imap.timer`.

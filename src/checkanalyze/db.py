@@ -1,21 +1,25 @@
 """Database helpers and ORM models."""
+
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Generator
 from datetime import datetime
-from typing import Generator, Optional
 
 from sqlalchemy import (
-    JSON,
+    BigInteger,
     Boolean,
     DateTime,
-    Float,
+    Enum,
     ForeignKey,
     Integer,
     Numeric,
     String,
+    Text,
     create_engine,
+    func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -35,131 +39,109 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    telegram_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, unique=True)
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    transactions: Mapped[list["Transaction"]] = relationship("Transaction", back_populates="user")
+    transactions: Mapped[list[Transaction]] = relationship("Transaction", back_populates="user")
+    receipts: Mapped[list[Receipt]] = relationship("Receipt", back_populates="user")
 
 
 class Category(Base):
     __tablename__ = "categories"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    code: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    name: Mapped[str] = mapped_column(String, nullable=False)
-    group_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    transactions: Mapped[list[Transaction]] = relationship("Transaction", back_populates="category")
+    receipt_items: Mapped[list[ReceiptItem]] = relationship(
+        "ReceiptItem", back_populates="category"
+    )
 
 
 class Transaction(Base):
     __tablename__ = "transactions"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
-    category_id: Mapped[int] = mapped_column(Integer, ForeignKey("categories.id"), nullable=False)
-    date: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=datetime.utcnow)
-    amount: Mapped[float] = mapped_column(Numeric(scale=2))
-    currency: Mapped[str] = mapped_column(String(3), default="RUB")
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
+    category_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("categories.id"), nullable=False
+    )
+    amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), default="RUB")
     is_approximate: Mapped[bool] = mapped_column(Boolean, default=False)
-    comment: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), default=datetime.utcnow)
-    is_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    receipt_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("receipts.id"), nullable=True
+    )
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     user: Mapped[User] = relationship("User", back_populates="transactions")
+    category: Mapped[Category] = relationship("Category", back_populates="transactions")
+    receipt: Mapped[Receipt | None] = relationship("Receipt", back_populates="transactions")
 
 
 class Receipt(Base):
-    """Stored receipt metadata for interactive review."""
-
     __tablename__ = "receipts"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
-    merchant_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("merchant_profiles.id"))
-    merchant_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    merchant_inn: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
-    currency: Mapped[str] = mapped_column(String(3), default="RUB")
-    total_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    source: Mapped[str] = mapped_column(String(32), default="telegram")
-    status: Mapped[str] = mapped_column(String(32), default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
+    source: Mapped[str] = mapped_column(
+        Enum("telegram", "email", "manual", name="receipt_source", create_type=False)
+    )
+    original_file: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    json_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    total_amount: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    tip_amount: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True, default=0)
+    merchant_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    merchant_inn: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    purchased_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    merchant: Mapped[Optional["MerchantProfile"]] = relationship("MerchantProfile")
-    items: Mapped[list["ReceiptItem"]] = relationship("ReceiptItem", back_populates="receipt")
-
-
-class MerchantProfile(Base):
-    """Merchant metadata for better predictions."""
-
-    __tablename__ = "merchant_profiles"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String, nullable=False)
-    inn: Mapped[Optional[str]] = mapped_column(String(20), index=True)
-    merchant_hash: Mapped[Optional[str]] = mapped_column(String(64), unique=True)
-    default_category_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("categories.id"))
-    hints: Mapped[dict] = mapped_column(JSON, default=dict)
-
-    category: Mapped[Optional[Category]] = relationship("Category")
-    receipt_items: Mapped[list["ReceiptItem"]] = relationship("ReceiptItem", back_populates="merchant")
+    user: Mapped[User] = relationship("User", back_populates="receipts")
+    items: Mapped[list[ReceiptItem]] = relationship("ReceiptItem", back_populates="receipt")
+    transactions: Mapped[list[Transaction]] = relationship("Transaction", back_populates="receipt")
 
 
 class ReceiptItem(Base):
-    """Extracted receipt line items."""
-
     __tablename__ = "receipt_items"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
-    merchant_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("merchant_profiles.id"))
-    receipt_id: Mapped[int] = mapped_column(Integer, ForeignKey("receipts.id"), nullable=False)
-    description: Mapped[str] = mapped_column(String, nullable=False)
-    quantity: Mapped[float] = mapped_column(Float, default=1.0)
-    amount: Mapped[float] = mapped_column(Numeric(scale=2))
-    currency: Mapped[str] = mapped_column(String(3), default="RUB")
-    is_income: Mapped[bool] = mapped_column(Boolean, default=False)
-    predicted_category_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("categories.id"))
-    selected_category_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("categories.id"))
-    is_manual: Mapped[bool] = mapped_column(Boolean, default=False)
-    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    line_number: Mapped[int] = mapped_column(Integer, default=1)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    receipt_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("receipts.id"), nullable=False)
+    line_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    item_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    qty: Mapped[float | None] = mapped_column(Numeric(12, 3), nullable=True)
+    unit_price: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    amount: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    category_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("categories.id"),
+        nullable=True,
+    )
 
-    merchant: Mapped[Optional[MerchantProfile]] = relationship("MerchantProfile", back_populates="receipt_items")
-    predicted_category: Mapped[Optional[Category]] = relationship("Category", foreign_keys=[predicted_category_id])
-    selected_category: Mapped[Optional[Category]] = relationship("Category", foreign_keys=[selected_category_id])
-    receipt: Mapped["Receipt"] = relationship("Receipt", back_populates="items")
+    receipt: Mapped[Receipt] = relationship("Receipt", back_populates="items")
+    category: Mapped[Category | None] = relationship("Category", back_populates="receipt_items")
 
 
-class CategoryTrainingSample(Base):
-    """Stores labelled samples for incremental learning."""
+class EmailInbox(Base):
+    __tablename__ = "email_inbox"
 
-    __tablename__ = "category_training_samples"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    message_id: Mapped[str | None] = mapped_column(Text, unique=True, nullable=True)
+    from_email: Mapped[str | None] = mapped_column(Text, nullable=True)
+    subject: Mapped[str | None] = mapped_column(Text, nullable=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
-    merchant_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("merchant_profiles.id"))
-    description: Mapped[str] = mapped_column(String, nullable=False)
-    amount: Mapped[float] = mapped_column(Float, nullable=True)
-    currency: Mapped[str] = mapped_column(String(3), default="RUB")
-    category_id: Mapped[int] = mapped_column(Integer, ForeignKey("categories.id"), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    merchant: Mapped[Optional[MerchantProfile]] = relationship("MerchantProfile")
-    category: Mapped[Category] = relationship("Category")
-
-
-class EmailIdentity(Base):
-    """Maps email addresses to users for mailbox ingestion."""
-
-    __tablename__ = "email_identities"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    user: Mapped[User | None] = relationship("User")
 
 
 _engine = create_engine(CONFIG.database.url, future=True)
@@ -167,18 +149,16 @@ SessionFactory = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
 
 
 def init_schema() -> None:
-    """Create tables if they do not exist."""
     Base.metadata.create_all(_engine)
 
 
 @contextlib.contextmanager
 def session_scope() -> Generator[Session, None, None]:
-    """Provide a transactional scope around a series of operations."""
     session = SessionFactory()
     try:
         yield session
         session.commit()
-    except Exception:
+    except Exception:  # noqa: BLE001
         session.rollback()
         raise
     finally:
@@ -191,10 +171,8 @@ __all__ = [
     "Category",
     "Transaction",
     "Receipt",
-    "MerchantProfile",
     "ReceiptItem",
-    "CategoryTrainingSample",
-    "EmailIdentity",
+    "EmailInbox",
     "SessionFactory",
     "session_scope",
     "init_schema",

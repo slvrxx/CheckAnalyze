@@ -1,51 +1,101 @@
 """Configuration management for CheckAnalyze services."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from typing import Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import cast
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-def _env(key: str, default: Optional[str] = None) -> Optional[str]:
-    """Read an environment variable."""
+def _env(key: str, default: str | None = None) -> str | None:
     value = os.getenv(key)
     if value is None:
         return default
     return value
 
 
+def _env_int(key: str) -> int | None:
+    value = _env(key)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    value = _env(key)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes"}
+
+
+def _env_str(key: str, default: str = "") -> str:
+    return cast(str, _env(key, default))
+
+
 @dataclass(slots=True)
 class DatabaseConfig:
     """Settings for connecting to PostgreSQL."""
 
-    url: str = _env("DATABASE_URL", "postgresql+psycopg2://user:pass@localhost:5432/checkanalyze")
+    host: str
+    port: int
+    name: str
+    user: str
+    password: str
+    url: str
+
+    def __init__(self) -> None:
+        default_host = _env_str("DB_HOST", "localhost")
+        default_port = int(_env_str("DB_PORT", "5432"))
+        default_name = _env_str("DB_NAME", "checkanalyze")
+        default_user = _env_str("DB_USER", "checkanalyze")
+        default_password = _env_str("DB_PASSWORD", "")
+
+        database_url = _env("DATABASE_URL")
+        if database_url:
+            self.url = database_url
+            self.host = default_host
+            self.port = default_port
+            self.name = default_name
+            self.user = default_user
+            self.password = default_password
+        else:
+            quoted_user = quote_plus(default_user)
+            quoted_password = quote_plus(default_password)
+            self.url = f"postgresql+psycopg2://{quoted_user}:{quoted_password}@{default_host}:{default_port}/{default_name}"
+            self.host = default_host
+            self.port = default_port
+            self.name = default_name
+            self.user = default_user
+            self.password = default_password
 
 
 @dataclass(slots=True)
 class TelegramConfig:
     """Telegram bot configuration."""
 
-    token: str = _env("TELEGRAM_BOT_TOKEN", "")
-    allowed_chat_id: Optional[int] = (
-        int(_env("TELEGRAM_ALLOWED_CHAT_ID")) if _env("TELEGRAM_ALLOWED_CHAT_ID") else None
-    )
-    webhook_url: Optional[str] = _env("TELEGRAM_WEBHOOK_URL")
+    token: str = _env_str("TELEGRAM_BOT_TOKEN", "")
+    admin_id: int | None = _env_int("TELEGRAM_ADMIN_ID")
 
 
 @dataclass(slots=True)
 class EmailConfig:
     """IMAP mailbox configuration."""
 
-    host: str = _env("IMAP_HOST", "")
-    username: str = _env("IMAP_USERNAME", "")
-    password: str = _env("IMAP_PASSWORD", "")
-    mailbox: str = _env("IMAP_MAILBOX", "INBOX")
-    check_interval: int = int(_env("IMAP_CHECK_INTERVAL", "120"))
-    use_ssl: bool = _env("IMAP_USE_SSL", "1") == "1"
+    host: str = _env_str("IMAP_HOST", "")
+    port: int = int(_env_str("IMAP_PORT", "993"))
+    use_ssl: bool = _env_bool("IMAP_USE_SSL", True)
+    username: str = _env_str("IMAP_USERNAME", "")
+    password: str = _env_str("IMAP_PASSWORD", "")
+    mailbox: str = _env_str("IMAP_MAILBOX", "INBOX")
 
 
 @dataclass(slots=True)
@@ -55,11 +105,16 @@ class AppConfig:
     database: DatabaseConfig = DatabaseConfig()
     telegram: TelegramConfig = TelegramConfig()
     email: EmailConfig = EmailConfig()
-    default_user_id: Optional[int] = (
-        int(_env("DEFAULT_USER_ID")) if _env("DEFAULT_USER_ID") else None
-    )
+    receipts_dir: Path = Path(_env_str("RECEIPTS_DIR", "/tmp/checkanalyze_receipts"))
+    default_user_id: int | None = _env_int("DEFAULT_USER_ID")
 
 
 CONFIG = AppConfig()
 
-__all__ = ["CONFIG", "AppConfig", "DatabaseConfig", "TelegramConfig", "EmailConfig"]
+__all__ = [
+    "CONFIG",
+    "AppConfig",
+    "DatabaseConfig",
+    "TelegramConfig",
+    "EmailConfig",
+]

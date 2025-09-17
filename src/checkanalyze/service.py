@@ -1,434 +1,268 @@
-"""Shared business logic for processing receipts."""
+"""Business logic helpers for receipts and inbox processing."""
+
 from __future__ import annotations
 
-from collections import Counter
+import os
 from dataclasses import dataclass
-import hashlib
-from typing import Iterable, List, Optional, Sequence
+from decimal import Decimal
+from pathlib import Path
+from uuid import uuid4
 
 import structlog
+from sqlalchemy import Select, select
+from sqlalchemy.orm import Session
 
-from .db import (
-    Category,
-    CategoryTrainingSample,
-    MerchantProfile,
-    Receipt,
-    ReceiptItem,
-    session_scope,
-)
-from .processing.categorizer import Categorizer
-from .processing.extraction import ReceiptParseResult, parse_receipt
+from .config import CONFIG
+from .db import Category, Receipt, Transaction, session_scope
 
-logger = structlog.get_logger(__name__)
+LOGGER = structlog.get_logger(__name__)
 
 
 @dataclass(slots=True)
-class ProcessedReceiptItem:
-    item_id: int
-    line_number: int
-    description: str
-    amount: float
+class ReceiptLine:
+    line_no: int | None
+    item_name: str
+    amount: Decimal
     currency: str
-    selected_category_name: Optional[str]
-    confidence: float
+    category_id: int | None
 
 
 @dataclass(slots=True)
-class ProcessedReceipt:
-    receipt_id: int
-    parse_result: ReceiptParseResult
-    items: List[ProcessedReceiptItem]
-    summary_text: str
-    merchant: Optional[MerchantProfile]
+class InboxEntry:
+    receipt: Receipt
+    lines: list[ReceiptLine]
 
 
-def process_receipt_bytes(user_id: int, data: bytes, source: str = "telegram") -> ProcessedReceipt:
-    """Parse, categorise and persist a receipt for a given user."""
-    parse_result = parse_receipt(data)
-    merchant = _find_or_create_merchant(parse_result.merchant_name, parse_result.merchant_inn)
-    categories = list(_fetch_categories(user_id))
-    categorizer = Categorizer()
-    predictions = categorizer.predict(parse_result, categories)
+def ensure_receipts_dir() -> Path:
+    """Ensure the receipts directory exists and return it."""
+    path = CONFIG.receipts_dir
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
-    stored_items: list[ProcessedReceiptItem] = []
+
+def store_receipt_file(user_id: int, data: bytes, filename: str, *, source: str) -> Receipt:
+    """Persist an uploaded receipt file and create a pending record."""
+    receipts_dir = ensure_receipts_dir()
+    extension = Path(filename).suffix or ".bin"
+    safe_name = f"{uuid4().hex}{extension}"
+    file_path = receipts_dir / safe_name
+    file_path.write_bytes(data)
+
     with session_scope() as session:
         receipt = Receipt(
             user_id=user_id,
-            merchant_id=merchant.id if merchant else None,
-            merchant_name=parse_result.merchant_name,
-            merchant_inn=parse_result.merchant_inn,
-            currency=parse_result.currency,
-            total_amount=parse_result.total_amount,
             source=source,
+            original_file=str(file_path),
+            status="pending",
         )
         session.add(receipt)
         session.flush()
-
-        for index, (candidate, prediction) in enumerate(zip(parse_result.items, predictions), start=1):
-            selected_category_id = prediction.category_id
-            receipt_item = ReceiptItem(
-                user_id=user_id,
-                merchant_id=merchant.id if merchant else None,
-                receipt_id=receipt.id,
-                description=candidate.description,
-                quantity=candidate.quantity,
-                amount=candidate.amount,
-                currency=candidate.currency,
-                is_income=False,
-                predicted_category_id=prediction.category_id,
-                selected_category_id=selected_category_id,
-                confidence=prediction.confidence,
-                line_number=index,
-            )
-            session.add(receipt_item)
-            session.flush()
-
-            stored_items.append(
-                ProcessedReceiptItem(
-                    item_id=receipt_item.id,
-                    line_number=index,
-                    description=candidate.description,
-                    amount=candidate.amount,
-                    currency=candidate.currency,
-                    selected_category_name=_category_name(categories, selected_category_id),
-                    confidence=prediction.confidence,
-                )
-            )
-
-        summary_text = build_receipt_summary(receipt, stored_items, include_instructions=True)
-
-    return ProcessedReceipt(
-        receipt_id=receipt.id,
-        parse_result=parse_result,
-        items=stored_items,
-        summary_text=summary_text,
-        merchant=merchant,
-    )
+        session.refresh(receipt)
+        LOGGER.info("receipt_stored", receipt_id=receipt.id, user_id=user_id, source=source)
+        return receipt
 
 
-def _category_name(categories: Sequence[Category], category_id: Optional[int]) -> Optional[str]:
-    if category_id is None:
-        return None
-    for category in categories:
-        if category.id == category_id:
-            return category.name
-    return None
-
-
-def _fetch_categories(user_id: int) -> Iterable[Category]:
+def list_inbox_entries(user_id: int) -> list[InboxEntry]:
+    """Fetch pending receipts with their items for the inbox view."""
     with session_scope() as session:
-        categories = (
-            session.query(Category)
-            .filter((Category.user_id == user_id) | (Category.user_id.is_(None)))
-            .order_by(Category.name)
+        receipts = (
+            session.execute(
+                select(Receipt)
+                .where(Receipt.user_id == user_id, Receipt.status == "pending")
+                .order_by(Receipt.created_at.desc())
+            )
+            .scalars()
             .all()
         )
-        for category in categories:
-            yield category
+        entries: list[InboxEntry] = []
+        for receipt in receipts:
+            lines = [
+                ReceiptLine(
+                    line_no=item.line_no,
+                    item_name=item.item_name or "Позиция",
+                    amount=_as_decimal(item.amount),
+                    currency=receipt.currency or "RUB",
+                    category_id=item.category_id,
+                )
+                for item in sorted(receipt.items, key=lambda i: (i.line_no or 0))
+            ]
+            entries.append(InboxEntry(receipt=receipt, lines=lines))
+        return entries
 
 
-def _find_or_create_merchant(name: Optional[str], inn: Optional[str]) -> Optional[MerchantProfile]:
-    if not name and not inn:
-        return None
-
-    with session_scope() as session:
-        merchant = None
-        if inn:
-            merchant = session.query(MerchantProfile).filter(MerchantProfile.inn == inn).one_or_none()
-        if not merchant and name:
-            merchant = (
-                session.query(MerchantProfile)
-                .filter(MerchantProfile.name.ilike(f"%{name}%"))
-                .first()
-            )
-        if merchant:
-            return merchant
-
-        merchant = MerchantProfile(
-            name=name or inn or "UNKNOWN",
-            inn=inn,
-            merchant_hash=_merchant_hash(name or inn or "UNKNOWN"),
-        )
-        session.add(merchant)
-        session.commit()
-        logger.info("merchant_created", merchant_id=merchant.id)
-        return merchant
-
-
-def _merchant_hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def build_receipt_summary(
-    receipt: Receipt,
-    items: Sequence[ProcessedReceiptItem] | Sequence[ReceiptItem],
-    *,
-    include_instructions: bool = False,
-) -> str:
-    """Build a human-readable summary of receipt items."""
+def format_inbox_entry(entry: InboxEntry) -> str:
+    """Create a human-readable summary for a pending receipt."""
+    receipt = entry.receipt
     header_parts = [f"Чек #{receipt.id}"]
     if receipt.merchant_name:
         header_parts.append(receipt.merchant_name)
-    if receipt.merchant_inn:
-        header_parts.append(f"ИНН {receipt.merchant_inn}")
+    if receipt.total_amount is not None and receipt.currency:
+        header_parts.append(f"Сумма: {receipt.total_amount:.2f} {receipt.currency}")
     header = " — ".join(header_parts)
 
-    lines = [header]
-    for item in items:
-        if isinstance(item, ReceiptItem):
-            category_name = (
-                item.selected_category.name
-                if item.selected_category is not None
-                else None
+    lines: list[str] = [header]
+    if entry.lines:
+        for line in entry.lines:
+            amount = f"{line.amount:.2f}" if line.amount is not None else "0.00"
+            category = str(line.category_id) if line.category_id is not None else "?"
+            prefix = f"{line.line_no}." if line.line_no else "-"
+            summary = (
+                f"{prefix} {line.item_name} — {amount} {line.currency}" f" → категория {category}"
             )
-            amount = float(item.amount)
-            currency = item.currency
-            description = item.description
-            confidence = item.confidence or 0.0
-            line_number = item.line_number
-        else:
-            category_name = item.selected_category_name
-            amount = item.amount
-            currency = item.currency
-            description = item.description
-            confidence = item.confidence
-            line_number = item.line_number
-
-        category_label = category_name or "UNKNOWN"
-        lines.append(
-            f"{line_number}. {description} — {amount:.2f} {currency} → {category_label} (p={confidence:.2f})"
-        )
-
-    if receipt.total_amount:
-        lines.append("")
-        lines.append(f"Итого: {receipt.total_amount:.2f} {receipt.currency}")
-
-    if include_instructions:
-        lines.append("")
-        lines.append("Изменить категорию: /cat <номер> <код или название>")
-        lines.append("Список категорий: /categories")
-        lines.append("Подтвердить чек: /confirm")
-
+            lines.append(summary)
+    else:
+        lines.append("Нет позиций. Можно подтвердить общую сумму.")
     return "\n".join(lines)
 
 
-def format_categories_message(user_id: int) -> str:
-    categories = list(_fetch_categories(user_id))
-    if not categories:
-        return "Категории не найдены. Добавьте категории в основной системе учёта."
-    lines = ["Доступные категории:"]
-    for category in categories:
-        code = category.code or "—"
-        lines.append(f"{category.id}: [{code}] {category.name}")
-    return "\n".join(lines)
-
-
-def set_receipt_item_category(
-    user_id: int,
-    receipt_id: int,
-    line_number: int,
-    category_token: str,
-) -> tuple[str, bool]:
-    """Assign a category to a receipt item by its position."""
-    category_token = category_token.strip()
+def confirm_receipt_total(user_id: int, receipt_id: int) -> tuple[str, bool]:
+    """Create a single transaction for the total amount."""
     with session_scope() as session:
-        receipt = session.query(Receipt).filter(Receipt.id == receipt_id, Receipt.user_id == user_id).one_or_none()
-        if not receipt:
-            return "Чек не найден или принадлежит другому пользователю.", False
+        receipt = _get_receipt_for_user(session, user_id, receipt_id)
+        if receipt is None:
+            return ("Чек не найден или нет доступа.", False)
+        if receipt.status != "pending":
+            return ("Чек уже обработан.", False)
+        if receipt.total_amount is None or receipt.currency is None:
+            return ("Неизвестна сумма чека — подтвердите позиции вручную.", False)
 
-        item = (
-            session.query(ReceiptItem)
-            .filter(ReceiptItem.receipt_id == receipt.id, ReceiptItem.line_number == line_number)
-            .one_or_none()
+        category_id = _resolve_total_category(session, receipt)
+        if category_id is None:
+            return ("Не найдена категория для записи транзакции.", False)
+
+        transaction = Transaction(
+            user_id=user_id,
+            category_id=category_id,
+            amount=receipt.total_amount,
+            currency=receipt.currency,
+            is_approximate=False,
+            comment=f"Receipt {receipt.id}",
+            source="email" if receipt.source == "email" else receipt.source,
+            receipt_id=receipt.id,
         )
-        if not item:
-            return "Строка с таким номером не найдена.", False
-
-        category = _resolve_category(session, user_id, category_token)
-        if not category:
-            return "Категория не найдена. Используйте /categories для просмотра списка.", False
-
-        item.selected_category_id = category.id
-        item.is_manual = True
+        session.add(transaction)
+        receipt.status = "confirmed"
         session.flush()
 
-        message = (
-            f"Строка {line_number} теперь в категории '{category.name}'."
-        )
-        return message, True
+    _cleanup_receipt_file(receipt)
+    return (f"Создана транзакция на сумму {receipt.total_amount:.2f} {receipt.currency}.", True)
 
 
-def _resolve_category(session, user_id: int, token: str) -> Optional[Category]:
-    token = token.strip()
-    # Try direct ID
-    if token.isdigit():
-        category = (
-            session.query(Category)
-            .filter(Category.id == int(token), (Category.user_id == user_id) | (Category.user_id.is_(None)))
-            .one_or_none()
-        )
-        if category:
-            return category
-
-    # Try code match
-    category = (
-        session.query(Category)
-        .filter(
-            (Category.user_id == user_id) | (Category.user_id.is_(None)),
-            Category.code.isnot(None),
-            Category.code.ilike(token),
-        )
-        .first()
-    )
-    if category:
-        return category
-
-    # Try name match (case-insensitive contains)
-    category = (
-        session.query(Category)
-        .filter((Category.user_id == user_id) | (Category.user_id.is_(None)))
-        .filter(Category.name.ilike(f"%{token}%"))
-        .first()
-    )
-    return category
-
-
-def confirm_receipt(user_id: int, receipt_id: int) -> tuple[str, bool]:
-    """Mark receipt as confirmed and record training samples."""
+def confirm_receipt_items(user_id: int, receipt_id: int) -> tuple[str, bool]:
+    """Create transactions for each receipt item."""
     with session_scope() as session:
-        receipt = session.query(Receipt).filter(Receipt.id == receipt_id, Receipt.user_id == user_id).one_or_none()
-        if not receipt:
-            return "Чек не найден или принадлежит другому пользователю.", False
+        receipt = _get_receipt_for_user(session, user_id, receipt_id)
+        if receipt is None:
+            return ("Чек не найден или нет доступа.", False)
+        if receipt.status != "pending":
+            return ("Чек уже обработан.", False)
+        if not receipt.items:
+            return ("У чека нет позиций — подтвердите общую сумму.", False)
 
-        items = session.query(ReceiptItem).filter(ReceiptItem.receipt_id == receipt.id).order_by(ReceiptItem.line_number).all()
-        if not items:
-            return "В чеке нет позиций для подтверждения.", False
-
-        for item in items:
-            if item.selected_category_id is None:
-                return f"У строки {item.line_number} не выбрана категория.", False
-
-        for item in items:
-            sample = CategoryTrainingSample(
+        created = 0
+        fallback_category = _fallback_category_id(session, user_id)
+        for item in receipt.items:
+            amount = item.amount
+            if amount is None:
+                continue
+            category_id = item.category_id or fallback_category
+            if category_id is None:
+                continue
+            transaction = Transaction(
                 user_id=user_id,
-                merchant_id=receipt.merchant_id,
-                description=item.description,
-                amount=float(item.amount),
-                currency=item.currency,
-                category_id=item.selected_category_id,
+                category_id=category_id,
+                amount=amount,
+                currency=receipt.currency or "RUB",
+                is_approximate=False,
+                comment=f"Receipt {receipt.id} — {item.item_name or 'позиция'}",
+                source="email" if receipt.source == "email" else receipt.source,
+                receipt_id=receipt.id,
             )
-            session.add(sample)
+            session.add(transaction)
+            created += 1
+        if created == 0:
+            return ("Не удалось создать транзакции: нет категорий у позиций.", False)
 
         receipt.status = "confirmed"
         session.flush()
 
-        if receipt.merchant_id and items:
-            _maybe_update_merchant_default(session, receipt.merchant_id, items)
-
-        summary = build_receipt_summary(receipt, items, include_instructions=False)
-        commands = _format_final_commands(items)
-
-    # Retrain categorizer with the new samples
-    Categorizer()
-
-    return f"{summary}\n\n{commands}", True
+    _cleanup_receipt_file(receipt)
+    return (f"Создано транзакций: {created}.", True)
 
 
-def _format_final_commands(items: Sequence[ReceiptItem]) -> str:
-    lines = ["Команды для записи:"]
-
-    for item in items:
-        entry_type = "I" if item.is_income else "E"
-        amount_value = _format_amount(float(item.amount))
-        currency = (item.currency or "RUB").upper()
-        category_token = _category_token(item)
-        accuracy_flag = 1  # PDF суммы считаем точными
-        comment = _format_comment(item.description)
-
-        lines.append(
-            f"{entry_type} {amount_value} {currency} {category_token} {accuracy_flag} {comment}"
-        )
-
-    return "\n".join(lines)
-
-
-def _format_amount(value: float) -> str:
-    text = f"{value:.2f}"
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text
-
-
-def _category_token(item: ReceiptItem) -> str:
-    category = item.selected_category
-    if category and category.code:
-        return category.code
-    if category and category.id:
-        return str(category.id)
-    if item.selected_category_id:
-        return str(item.selected_category_id)
-    if item.predicted_category_id:
-        return str(item.predicted_category_id)
-    return "UNKNOWN"
-
-
-def _format_comment(description: str) -> str:
-    return " ".join(description.strip().split()) or "—"
-
-
-def _maybe_update_merchant_default(session, merchant_id: int, items: Sequence[ReceiptItem]) -> None:
-    merchant = session.query(MerchantProfile).filter(MerchantProfile.id == merchant_id).one_or_none()
-    if not merchant:
-        return
-    category_ids = [item.selected_category_id for item in items if item.selected_category_id]
-    if not category_ids:
-        return
-    most_common_id, count = Counter(category_ids).most_common(1)[0]
-    if count >= 2:
-        merchant.default_category_id = most_common_id
-
-
-def get_receipt_summary(user_id: int, receipt_id: int) -> Optional[str]:
+def decline_receipt(user_id: int, receipt_id: int, *, delete_file: bool = True) -> tuple[str, bool]:
+    """Mark receipt as failed and optionally remove file."""
     with session_scope() as session:
-        receipt = session.query(Receipt).filter(Receipt.id == receipt_id, Receipt.user_id == user_id).one_or_none()
-        if not receipt:
-            return None
-        items = (
-            session.query(ReceiptItem)
-            .filter(ReceiptItem.receipt_id == receipt.id)
-            .order_by(ReceiptItem.line_number)
-            .all()
-        )
-        return build_receipt_summary(receipt, items, include_instructions=True)
+        receipt = _get_receipt_for_user(session, user_id, receipt_id)
+        if receipt is None:
+            return ("Чек не найден или нет доступа.", False)
+        if receipt.status != "pending":
+            return ("Чек уже обработан.", False)
+        receipt.status = "failed"
+        session.flush()
+
+    if delete_file:
+        _cleanup_receipt_file(receipt)
+    return ("Чек отклонён.", True)
 
 
-def list_pending_receipts(user_id: int) -> str:
-    with session_scope() as session:
-        receipts = (
-            session.query(Receipt)
-            .filter(Receipt.user_id == user_id, Receipt.status == "pending")
-            .order_by(Receipt.created_at.desc())
-            .all()
-        )
-        if not receipts:
-            return "Нет неподтверждённых чеков."
-        lines = ["Неподтверждённые чеки:"]
-        for receipt in receipts:
-            merchant = receipt.merchant_name or "Без названия"
-            lines.append(
-                f"#{receipt.id} — {merchant} ({receipt.created_at.strftime('%Y-%m-%d %H:%M')})"
-            )
-        lines.append("\nИспользуйте /receipt <id>, чтобы посмотреть чек.")
-        return "\n".join(lines)
+def _cleanup_receipt_file(receipt: Receipt) -> None:
+    file_path = receipt.original_file
+    if not file_path:
+        return
+    try:
+        os.remove(file_path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:  # noqa: BLE001
+        LOGGER.warning("receipt_file_cleanup_failed", receipt_id=receipt.id, error=str(exc))
+
+
+def _get_receipt_for_user(session: Session, user_id: int, receipt_id: int) -> Receipt | None:
+    return (
+        session.execute(select(Receipt).where(Receipt.id == receipt_id, Receipt.user_id == user_id))
+        .scalars()
+        .one_or_none()
+    )
+
+
+def _resolve_total_category(session: Session, receipt: Receipt) -> int | None:
+    category_id = None
+    if receipt.items:
+        non_null = [item.category_id for item in receipt.items if item.category_id is not None]
+        if len(set(non_null)) == 1:
+            category_id = non_null[0]
+    if category_id is None:
+        category_id = _fallback_category_id(session, receipt.user_id)
+    return category_id
+
+
+def _fallback_category_id(session: Session, user_id: int) -> int | None:
+    stmt: Select[tuple[int]] = (
+        select(Category.id).where(Category.id.isnot(None)).order_by(Category.id.asc()).limit(1)
+    )
+    result = session.execute(stmt).first()
+    if result is None:
+        return None
+    return result[0]
+
+
+def _as_decimal(value: float | Decimal | None) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
 
 
 __all__ = [
-    "ProcessedReceipt",
-    "ProcessedReceiptItem",
-    "process_receipt_bytes",
-    "format_categories_message",
-    "set_receipt_item_category",
-    "confirm_receipt",
-    "get_receipt_summary",
-    "list_pending_receipts",
+    "InboxEntry",
+    "ReceiptLine",
+    "confirm_receipt_items",
+    "confirm_receipt_total",
+    "decline_receipt",
+    "ensure_receipts_dir",
+    "format_inbox_entry",
+    "list_inbox_entries",
+    "store_receipt_file",
 ]

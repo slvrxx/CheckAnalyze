@@ -1,0 +1,10 @@
+[Unit]
+Description=CheckAnalyze IMAP receipt fetcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/CheckAnalyze
+EnvironmentFile=/opt/CheckAnalyze/.env
+ExecStart=/usr/bin/python3 -m checkanalyze.imap_fetcher

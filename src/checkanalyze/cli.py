@@ -1,102 +1,76 @@
 """Command line interface for CheckAnalyze."""
+
 from __future__ import annotations
 
 import asyncio
-import typer
-import structlog
 
-from .db import EmailIdentity, init_schema, session_scope
-from .email_ingest import EmailIngestor
+import structlog
+import typer
+
 from .service import (
-    confirm_receipt,
-    format_categories_message,
-    get_receipt_summary,
-    list_pending_receipts,
+    confirm_receipt_items,
+    confirm_receipt_total,
+    decline_receipt,
+    format_inbox_entry,
+    list_inbox_entries,
 )
 from .telegram_bot import run_bot
 
 app = typer.Typer(help="CheckAnalyze service commands")
 receipts_app = typer.Typer(help="Утилиты для работы с чеками")
 app.add_typer(receipts_app, name="receipts")
-logger = structlog.get_logger(__name__)
-
-
-@app.command()
-def initdb() -> None:
-    """Initialise database tables."""
-    init_schema()
-    typer.echo("Database schema ensured.")
+LOGGER = structlog.get_logger(__name__)
 
 
 @app.command()
 def telegram() -> None:
     """Run the Telegram bot."""
-    init_schema()
+    LOGGER.info("telegram_bot_starting")
     asyncio.run(run_bot())
 
 
-@app.command()
-def email_worker(forever: bool = typer.Option(True, help="Poll mailbox continuously.")) -> None:
-    """Run the email ingestion worker."""
-    worker = EmailIngestor()
-    if forever:
-        worker.run_forever()
-    else:
-        processed = worker.poll_once()
-        typer.echo(f"Processed {processed} messages")
+@receipts_app.command("inbox")
+def receipts_inbox(user_id: int = typer.Option(..., help="ID пользователя")) -> None:
+    entries = list_inbox_entries(user_id)
+    if not entries:
+        typer.echo("Нет входящих чеков.")
+        raise typer.Exit()
+    for entry in entries:
+        typer.echo(format_inbox_entry(entry))
+        typer.echo("-")
 
 
-@receipts_app.command("pending")
-def receipts_pending(user_id: int = typer.Option(..., help="ID пользователя")) -> None:
-    typer.echo(list_pending_receipts(user_id))
-
-
-@receipts_app.command("show")
-def receipts_show(
+@receipts_app.command("confirm-total")
+def receipts_confirm_total(
     receipt_id: int = typer.Argument(..., help="ID чека"),
     user_id: int = typer.Option(..., help="ID пользователя"),
 ) -> None:
-    summary = get_receipt_summary(user_id, receipt_id)
-    if not summary:
-        typer.echo("Чек не найден или нет доступа.")
-        raise typer.Exit(code=1)
-    typer.echo(summary)
-
-
-@receipts_app.command("confirm")
-def receipts_confirm(
-    receipt_id: int = typer.Argument(..., help="ID чека"),
-    user_id: int = typer.Option(..., help="ID пользователя"),
-) -> None:
-    message, success = confirm_receipt(user_id, receipt_id)
+    message, success = confirm_receipt_total(user_id, receipt_id)
     typer.echo(message)
     if not success:
         raise typer.Exit(code=1)
 
 
-@receipts_app.command("categories")
-def receipts_categories(user_id: int = typer.Option(..., help="ID пользователя")) -> None:
-    typer.echo(format_categories_message(user_id))
-
-
-@receipts_app.command("link-email")
-def receipts_link_email(
-    email: str = typer.Argument(..., help="Email адрес"),
+@receipts_app.command("confirm-items")
+def receipts_confirm_items(
+    receipt_id: int = typer.Argument(..., help="ID чека"),
     user_id: int = typer.Option(..., help="ID пользователя"),
 ) -> None:
-    normalized = email.strip().lower()
-    with session_scope() as session:
-        existing = (
-            session.query(EmailIdentity).filter(EmailIdentity.email == normalized).one_or_none()
-        )
-        if existing:
-            existing.user_id = user_id
-            action = "обновлён"
-        else:
-            identity = EmailIdentity(email=normalized, user_id=user_id)
-            session.add(identity)
-            action = "создан"
-    typer.echo(f"Маппинг для {normalized} {action}.")
+    message, success = confirm_receipt_items(user_id, receipt_id)
+    typer.echo(message)
+    if not success:
+        raise typer.Exit(code=1)
+
+
+@receipts_app.command("decline")
+def receipts_decline(
+    receipt_id: int = typer.Argument(..., help="ID чека"),
+    user_id: int = typer.Option(..., help="ID пользователя"),
+) -> None:
+    message, success = decline_receipt(user_id, receipt_id)
+    typer.echo(message)
+    if not success:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

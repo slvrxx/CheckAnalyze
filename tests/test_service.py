@@ -1,159 +1,161 @@
-import email
-import importlib
+"""Integration tests using PostgreSQL for migrations and email ingestion."""
 
+from __future__ import annotations
+
+from collections.abc import Iterator
+from email.message import EmailMessage
+from pathlib import Path
+
+import psycopg2
 import pytest
 
-pytest.importorskip("sqlalchemy")
+try:
+    from pytest_postgresql.factories import init_postgresql_database
+except Exception:  # noqa: BLE001
+    init_postgresql_database = None
 
-from sqlalchemy import create_engine
-from sqlalchemy.pool import StaticPool
+from checkanalyze.imap_fetcher import Config, ingest_email_message
+
+MIGRATION_PATH = Path("migrations/0001_prod_schema.sql")
 
 
-@pytest.fixture
-def app_modules(monkeypatch):
-    monkeypatch.setenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
+postgresql = init_postgresql_database() if callable(init_postgresql_database) else None
+
+
+@pytest.fixture()
+def pg_connection() -> Iterator[psycopg2.extensions.connection]:
+    if postgresql is None:
+        pytest.skip("PostgreSQL binaries are not available")
+    try:
+        dsn = postgresql.dsn()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"PostgreSQL fixture unavailable: {exc}")
+        return
+    conn = psycopg2.connect(**dsn)
+    conn.autocommit = True
+    _prepare_base_schema(conn)
+    yield conn
+    conn.close()
+
+
+def _prepare_base_schema(conn: psycopg2.extensions.connection) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                email TEXT,
+                telegram_id BIGINT,
+                name TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS categories (
+                id BIGSERIAL PRIMARY KEY,
+                code VARCHAR(32),
+                name TEXT
+            );
+
+            INSERT INTO categories (id, code, name)
+            VALUES (1, 'default', 'Default Category')
+            ON CONFLICT (id) DO NOTHING;
+
+            CREATE TABLE IF NOT EXISTS transactions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                category_id BIGINT NOT NULL REFERENCES categories(id),
+                amount NUMERIC(14,2),
+                currency VARCHAR(10),
+                is_approximate BOOLEAN DEFAULT FALSE,
+                comment TEXT,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO users (id, email, name)
+            VALUES (1, 'user@example.com', 'Tester')
+            ON CONFLICT (id) DO NOTHING
+            """
+        )
+
+
+def test_migration_is_idempotent(pg_connection) -> None:
+    script = MIGRATION_PATH.read_text()
+    with pg_connection.cursor() as cur:
+        cur.execute(script)
+        cur.execute(script)
+
+    with pg_connection.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM receipts")
+        count = cur.fetchone()
+        assert count is not None
+
+
+def test_ingest_email_creates_receipt(
+    pg_connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = MIGRATION_PATH.read_text()
+    with pg_connection.cursor() as cur:
+        cur.execute(script)
+
+    receipts_dir = tmp_path / "receipts"
+    monkeypatch.setenv("RECEIPTS_DIR", str(receipts_dir))
+    monkeypatch.setenv("DB_HOST", pg_connection.info.host)
+    monkeypatch.setenv("DB_PORT", str(pg_connection.info.port))
+    monkeypatch.setenv("DB_NAME", pg_connection.info.dbname)
+    monkeypatch.setenv("DB_USER", pg_connection.info.user)
+    monkeypatch.setenv("DB_PASSWORD", pg_connection.info.password or "")
+    monkeypatch.setenv("IMAP_HOST", "imap.test")
+    monkeypatch.setenv("IMAP_PORT", "993")
+    monkeypatch.setenv("IMAP_USE_SSL", "true")
+    monkeypatch.setenv("IMAP_USERNAME", "tester")
+    monkeypatch.setenv("IMAP_PASSWORD", "secret")
+    monkeypatch.setenv("IMAP_MAILBOX", "INBOX")
     monkeypatch.setenv("DEFAULT_USER_ID", "1")
 
-    import checkanalyze.config as config
-    importlib.reload(config)
+    config = Config()
 
-    import checkanalyze.db as db
-    importlib.reload(db)
-
-    engine = create_engine(
-        "sqlite+pysqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-        future=True,
-    )
-    db._engine = engine
-    db.SessionFactory.configure(bind=engine)
-    db.init_schema()
-
-    import checkanalyze.service as service
-    importlib.reload(service)
-
-    import checkanalyze.email_ingest as email_ingest
-    importlib.reload(email_ingest)
-
-    return config, db, service, email_ingest
-
-
-def _prepare_dummy_receipt(monkeypatch, db, service):
-    from checkanalyze.processing.extraction import ReceiptParseResult, ReceiptItemCandidate
-    from checkanalyze.processing.categorizer import CategorizedItem
-
-    with db.session_scope() as session:
-        user = db.User(telegram_id=12345, name="Tester")
-        session.add(user)
-        session.flush()
-        user_id = user.id
-
-        food_category = db.Category(name="Продукты", code="12")
-        session.add(food_category)
-        session.flush()
-        food_category_id = food_category.id
-
-        beer_category = db.Category(name="Пиво", code="38")
-        session.add(beer_category)
-        session.flush()
-
-    parse_result = ReceiptParseResult(
-        merchant_name="Магазин",
-        merchant_inn="1234567890",
-        currency="RUB",
-        total_amount=200.0,
-        items=[
-            ReceiptItemCandidate(description="Продукты", amount=150.0, currency="RUB"),
-            ReceiptItemCandidate(description="Пиво", amount=50.0, currency="RUB"),
-        ],
+    message = EmailMessage()
+    message["Subject"] = "Test Receipt"
+    message["From"] = "Tester <user@example.com>"
+    message["To"] = "bot@example.com"
+    message["Message-ID"] = "<test-1@example.com>"
+    message.set_content("Спасибо за покупку")
+    message.add_attachment(
+        b"PDFDATA",
+        maintype="application",
+        subtype="pdf",
+        filename="receipt.pdf",
     )
 
-    predictions = [
-        CategorizedItem(
-            description="Продукты",
-            amount=150.0,
-            currency="RUB",
-            category_id=food_category_id,
-            category_name="Продукты",
-            confidence=0.91,
-        ),
-        CategorizedItem(
-            description="Пиво",
-            amount=50.0,
-            currency="RUB",
-            category_id=None,
-            category_name=None,
-            confidence=0.22,
-        ),
-    ]
+    ingested = ingest_email_message(pg_connection, config, message)
+    assert ingested is True
 
-    monkeypatch.setattr(service, "parse_receipt", lambda data: parse_result)
+    with pg_connection.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM email_inbox")
+        inbox_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM receipts")
+        receipt_count = cur.fetchone()[0]
+        cur.execute("SELECT original_file, status, source FROM receipts")
+        file_path, status, source = cur.fetchone()
 
-    class DummyCategorizer:
-        def predict(self, result, categories):
-            return predictions
+    assert inbox_count == 1
+    assert receipt_count == 1
+    assert status == "pending"
+    assert source == "email"
+    assert Path(file_path).exists()
 
-    monkeypatch.setattr(service, "Categorizer", lambda: DummyCategorizer())
+    # Duplicate message should be ignored
+    ingested_again = ingest_email_message(pg_connection, config, message)
+    assert ingested_again is False
 
-    return user_id
+    with pg_connection.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM receipts")
+        assert cur.fetchone()[0] == 1
 
-
-def test_process_receipt_bytes_creates_summary(monkeypatch, app_modules):
-    _config, db, service, _ = app_modules
-    user_id = _prepare_dummy_receipt(monkeypatch, db, service)
-
-    processed = service.process_receipt_bytes(user_id, b"pdf-data", source="telegram")
-
-    assert processed.receipt_id > 0
-    assert "Чек #" in processed.summary_text
-    assert "Список категорий" in processed.summary_text
-
-    with db.session_scope() as session:
-        receipt = session.query(db.Receipt).get(processed.receipt_id)
-        assert receipt is not None
-        assert len(receipt.items) == 2
-        assert receipt.items[0].predicted_category_id is not None
-
-
-def test_set_category_and_confirm(monkeypatch, app_modules):
-    _config, db, service, _ = app_modules
-    user_id = _prepare_dummy_receipt(monkeypatch, db, service)
-
-    processed = service.process_receipt_bytes(user_id, b"pdf-data", source="telegram")
-
-    message, success = service.set_receipt_item_category(user_id, processed.receipt_id, 2, "Пиво")
-    assert success
-    assert "Строка 2" in message
-
-    confirm_message, confirmed = service.confirm_receipt(user_id, processed.receipt_id)
-    assert confirmed
-    assert "Команды для записи" in confirm_message
-
-    commands_block = confirm_message.split("Команды для записи:", 1)[1].strip().splitlines()
-    assert commands_block[0] == "E 150 RUB 12 1 Продукты"
-    assert commands_block[1] == "E 50 RUB 38 1 Пиво"
-
-    with db.session_scope() as session:
-        receipt = session.query(db.Receipt).get(processed.receipt_id)
-        assert receipt.status == "confirmed"
-        samples = session.query(db.CategoryTrainingSample).all()
-        assert len(samples) == 2
-
-
-def test_email_identity_resolution(app_modules):
-    _config, db, _, email_ingest = app_modules
-
-    with db.session_scope() as session:
-        user = db.User(telegram_id=777, name="Email User")
-        session.add(user)
-        session.flush()
-        identity = db.EmailIdentity(user_id=user.id, email="test@example.com")
-        session.add(identity)
-
-    ingestor = email_ingest.EmailIngestor()
-
-    message = email.message_from_string("From: Test <test@example.com>\n\nBody")
-    resolved_id = ingestor._resolve_user(message)
-
-    assert resolved_id == user.id
+    # Clean up saved files
+    for path in receipts_dir.glob("*"):
+        path.unlink()
