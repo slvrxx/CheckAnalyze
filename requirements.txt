@@ -1,0 +1,6 @@
+python-telegram-bot>=20,<21
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
+python-dotenv>=1.0
+typer>=0.9
+structlog>=23.1
